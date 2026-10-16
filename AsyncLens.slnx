@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="AsyncLens/AsyncLens.CodeFixes/AsyncLens.CodeFixes.csproj" />
+  <Project Path="AsyncLens/AsyncLens.Package/AsyncLens.Package.csproj" />
+  <Project Path="AsyncLens/AsyncLens.Test/AsyncLens.Test.csproj" />
+  <Project Path="AsyncLens/AsyncLens.Vsix/AsyncLens.Vsix.csproj" />
+  <Project Path="AsyncLens/AsyncLens/AsyncLens.csproj" />
+</Solution>
