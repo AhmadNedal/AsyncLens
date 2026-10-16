@@ -9,6 +9,19 @@ namespace AsyncLens.Test
     [TestClass]
     public class AsyncLensUnitTest
     {
+        // Helper: the diagnostic must remain and the code must stay unchanged (no fix offered).
+        private static async Task VerifyNoFixAsync(string sourceWithMarkup)
+        {
+            var t = new VerifyCS.Test
+            {
+                TestCode = sourceWithMarkup,
+                FixedCode = sourceWithMarkup,
+            };
+            await t.RunAsync();
+        }
+
+        // ============================================================ existing tests
+
         [TestMethod]
         public async Task NoWarning_WhenTaskIsAwaited()
         {
@@ -186,18 +199,6 @@ class TestClass
             await VerifyCS.VerifyAnalyzerAsync(test);
         }
 
-        // Helper: the diagnostic must remain and the code must stay unchanged (no fix offered).
-        private static async Task VerifyNoFixAsync(string sourceWithMarkup)
-        {
-            var t = new VerifyCS.Test
-            {
-                TestCode = sourceWithMarkup,
-                FixedCode = sourceWithMarkup,
-            };
-            await t.RunAsync();
-        }
-
-
         [TestMethod]
         public async Task CodeFix_MakesVoidMethodAsyncTask()
         {
@@ -335,7 +336,6 @@ class TestClass
 }");
         }
 
-
         [TestMethod]
         public async Task NoCodeFix_WhenInsideLock()
         {
@@ -396,8 +396,6 @@ class TestClass
 }");
         }
 
-
-
         [TestMethod]
         public async Task NoWarning_ForCustomGetAwaiterAndGetResult()
         {
@@ -415,8 +413,6 @@ class TestClass
 
             await VerifyCS.VerifyAnalyzerAsync(test);
         }
-
-
 
         [TestMethod]
         public async Task Warning_WhenUsingTaskWaitWithTimeout()
@@ -437,13 +433,9 @@ class TestClass
     }
 }";
 
-            var expected = VerifyCS.Diagnostic("ASYNC001")
-                .WithLocation(0);
-
+            var expected = VerifyCS.Diagnostic("ASYNC001").WithLocation(0);
             await VerifyCS.VerifyAnalyzerAsync(test, expected);
         }
-
-
 
         [TestMethod]
         public async Task NoWarning_WhenUsingUnrelatedWaitWithArguments()
@@ -469,8 +461,6 @@ class TestClass
             await VerifyCS.VerifyAnalyzerAsync(test);
         }
 
-
-
         [TestMethod]
         public async Task NoWarning_WhenUsingCustomGetResult()
         {
@@ -494,8 +484,6 @@ class TestClass
 
             await VerifyCS.VerifyAnalyzerAsync(test);
         }
-
-
 
         [TestMethod]
         public async Task NoWarning_WhenResultIsNotTaskResult()
@@ -557,15 +545,9 @@ class TestClass
     }
 }";
 
-            var expected = VerifyCS.Diagnostic("ASYNC001")
-                .WithLocation(0);
-
+            var expected = VerifyCS.Diagnostic("ASYNC001").WithLocation(0);
             await VerifyCS.VerifyCodeFixAsync(test, expected, fixedCode);
         }
-
-
-
-
 
         [TestMethod]
         public async Task CodeFix_PreservesMemberAccess_WhenReplacingTaskResult()
@@ -604,14 +586,546 @@ class TestClass
     }
 }";
 
-            var expected = VerifyCS.Diagnostic("ASYNC001")
-                .WithLocation(0);
-
+            var expected = VerifyCS.Diagnostic("ASYNC001").WithLocation(0);
             await VerifyCS.VerifyCodeFixAsync(test, expected, fixedCode);
         }
 
+        // ============================================================ new: ASYNC001 coverage
 
+        [TestMethod]
+        public async Task Warning_WhenUsingConfigureAwaitGetAwaiterGetResult()
+        {
+            var test = @"
+using System.Threading.Tasks;
 
+class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
 
+    public void Test()
+    {
+        var r = GetDataAsync().ConfigureAwait(false).GetAwaiter().{|#0:GetResult|}();
+    }
+}";
+
+            var expected = VerifyCS.Diagnostic("ASYNC001").WithLocation(0);
+            await VerifyCS.VerifyAnalyzerAsync(test, expected);
+        }
+
+        [TestMethod]
+        public async Task CodeFix_ReplacesConfigureAwaitGetResult_WhenEnclosingAsync()
+        {
+            var test = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
+
+    public async Task TestAsync()
+    {
+        await Task.Delay(1);
+        var result = GetDataAsync().ConfigureAwait(false).GetAwaiter().{|#0:GetResult|}();
+    }
+}";
+
+            var fixtest = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
+
+    public async Task TestAsync()
+    {
+        await Task.Delay(1);
+        var result = await GetDataAsync().ConfigureAwait(false);
+    }
+}";
+
+            var expected = VerifyCS.Diagnostic("ASYNC001").WithLocation(0);
+            await VerifyCS.VerifyCodeFixAsync(test, expected, fixtest);
+        }
+
+        [TestMethod]
+        public async Task Warning_WhenUsingTaskWaitAll()
+        {
+            var test = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
+
+    public void Test()
+    {
+        Task.{|#0:WaitAll|}(GetDataAsync(), GetDataAsync());
+    }
+}";
+
+            var expected = VerifyCS.Diagnostic("ASYNC001").WithLocation(0);
+            await VerifyCS.VerifyAnalyzerAsync(test, expected);
+        }
+
+        [TestMethod]
+        public async Task Warning_WhenUsingTaskWaitAny()
+        {
+            var test = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
+
+    public void Test()
+    {
+        var i = Task.{|#0:WaitAny|}(GetDataAsync());
+    }
+}";
+
+            var expected = VerifyCS.Diagnostic("ASYNC001").WithLocation(0);
+            await VerifyCS.VerifyAnalyzerAsync(test, expected);
+        }
+
+        [TestMethod]
+        public async Task NoCodeFix_ForWaitAll()
+        {
+            await VerifyNoFixAsync(@"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
+
+    public async Task TestAsync()
+    {
+        await Task.Delay(1);
+        Task.{|ASYNC001:WaitAll|}(GetDataAsync());
+    }
+}");
+        }
+
+        [TestMethod]
+        public async Task Warning_WhenUsingWaitWithTimeSpan()
+        {
+            var test = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task GetDataAsync() { return Task.CompletedTask; }
+
+    public void Test()
+    {
+        GetDataAsync().{|#0:Wait|}(System.TimeSpan.FromSeconds(1));
+    }
+}";
+
+            var expected = VerifyCS.Diagnostic("ASYNC001").WithLocation(0);
+            await VerifyCS.VerifyAnalyzerAsync(test, expected);
+        }
+
+        [TestMethod]
+        public async Task Warning_WhenUsingWaitWithCancellationToken()
+        {
+            var test = @"
+using System.Threading;
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task GetDataAsync() { return Task.CompletedTask; }
+
+    public void Test()
+    {
+        GetDataAsync().{|#0:Wait|}(1000, CancellationToken.None);
+    }
+}";
+
+            var expected = VerifyCS.Diagnostic("ASYNC001").WithLocation(0);
+            await VerifyCS.VerifyAnalyzerAsync(test, expected);
+        }
+
+        [TestMethod]
+        public async Task Warning_WhenUsingTaskRunResult()
+        {
+            var test = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public void Test()
+    {
+        var r = Task.Run(() => 1).{|#0:Result|};
+    }
+}";
+
+            var expected = VerifyCS.Diagnostic("ASYNC001").WithLocation(0);
+            await VerifyCS.VerifyAnalyzerAsync(test, expected);
+        }
+
+        [TestMethod]
+        public async Task Warning_ReportsEachBlockingCall_InSameMethod()
+        {
+            var test = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
+
+    public void Test()
+    {
+        var r = GetDataAsync().{|#0:Result|};
+        GetDataAsync().{|#1:Wait|}();
+    }
+}";
+
+            var expected0 = VerifyCS.Diagnostic("ASYNC001").WithLocation(0);
+            var expected1 = VerifyCS.Diagnostic("ASYNC001").WithLocation(1);
+            await VerifyCS.VerifyAnalyzerAsync(test, expected0, expected1);
+        }
+
+        [TestMethod]
+        public async Task NoWarning_ForGeneratedCode()
+        {
+            var test = @"// <auto-generated />
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
+
+    public void Test()
+    {
+        var r = GetDataAsync().Result;
+    }
+}";
+
+            await VerifyCS.VerifyAnalyzerAsync(test);
+        }
+
+        // ============================================================ new: already-completed tasks
+
+        [TestMethod]
+        public async Task NoWarning_WhenTaskIsAlreadyCompleted_FromResultAndCompletedTask()
+        {
+            var test = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public void Test()
+    {
+        var r = Task.FromResult(1).Result;
+        Task.CompletedTask.Wait();
+    }
+}";
+
+            await VerifyCS.VerifyAnalyzerAsync(test);
+        }
+
+        [TestMethod]
+        public async Task NoWarning_WhenTaskWasAwaitedEarlier()
+        {
+            var test = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
+
+    public async Task TestAsync()
+    {
+        var t = GetDataAsync();
+        await t;
+        var r = t.Result;
+    }
+}";
+
+            await VerifyCS.VerifyAnalyzerAsync(test);
+        }
+
+        [TestMethod]
+        public async Task NoWarning_AfterAwaitTaskWhenAll()
+        {
+            var test = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
+
+    public async Task TestAsync()
+    {
+        var a = GetDataAsync();
+        var b = GetDataAsync();
+        await Task.WhenAll(a, b);
+        var sum = a.Result + b.Result;
+    }
+}";
+
+            await VerifyCS.VerifyAnalyzerAsync(test);
+        }
+
+        [TestMethod]
+        public async Task Warning_WhenTaskIsAwaitedOnlyInsideBranch()
+        {
+            var test = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
+
+    public async Task TestAsync(bool flag)
+    {
+        var t = GetDataAsync();
+        if (flag)
+        {
+            await t;
+        }
+        var r = t.{|#0:Result|};
+    }
+}";
+
+            var expected = VerifyCS.Diagnostic("ASYNC001").WithLocation(0);
+            await VerifyCS.VerifyAnalyzerAsync(test, expected);
+        }
+
+        [TestMethod]
+        public async Task NoWarning_InsideContinueWith()
+        {
+            var test = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
+
+    public void Test()
+    {
+        GetDataAsync().ContinueWith(t => t.Result);
+    }
+}";
+
+            await VerifyCS.VerifyAnalyzerAsync(test);
+        }
+
+        // ============================================================ new: code fix safety
+
+        [TestMethod]
+        public async Task CodeFix_ConvertsExpressionBodiedMember()
+        {
+            var test = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
+
+    private int Test() => GetDataAsync().{|#0:Result|};
+}";
+
+            var fixtest = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
+
+    private async Task<int> Test() => await GetDataAsync();
+}";
+
+            var expected = VerifyCS.Diagnostic("ASYNC001").WithLocation(0);
+            await VerifyCS.VerifyCodeFixAsync(test, expected, fixtest);
+        }
+
+        [TestMethod]
+        public async Task NoCodeFix_WhenVoidMethodHasCallers()
+        {
+            await VerifyNoFixAsync(@"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
+
+    private void Test()
+    {
+        var r = GetDataAsync().{|ASYNC001:Result|};
+    }
+
+    public void Caller()
+    {
+        Test();
+    }
+}");
+        }
+
+        [TestMethod]
+        public async Task NoCodeFix_WhenVoidMethodIsPubliclyVisible()
+        {
+            await VerifyNoFixAsync(@"
+using System.Threading.Tasks;
+
+public class TestClass
+{
+    public Task<int> GetDataAsync() { return Task.FromResult(10); }
+
+    public void Test()
+    {
+        var r = GetDataAsync().{|ASYNC001:Result|};
+    }
+}");
+        }
+
+        // ============================================================ new: ASYNC002 (Thread.Sleep)
+
+        [TestMethod]
+        public async Task Warning_WhenThreadSleepInsideAsyncMethod()
+        {
+            var test = @"
+using System.Threading;
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public async Task TestAsync()
+    {
+        await Task.Delay(1);
+        Thread.{|#0:Sleep|}(1000);
+    }
+}";
+
+            var expected = VerifyCS.Diagnostic("ASYNC002").WithLocation(0);
+            await VerifyCS.VerifyAnalyzerAsync(test, expected);
+        }
+
+        //        [TestMethod]
+        //        public async Task CodeFix_ReplacesThreadSleepWithTaskDelay()
+        //        {
+        //            var test = @"
+        //using System.Threading;
+        //using System.Threading.Tasks;
+
+        //class TestClass
+        //{
+        //    public async Task TestAsync()
+        //    {
+        //        await Task.Delay(1);
+        //        Thread.{|#0:Sleep|}(1000);
+        //    }
+        //}";
+
+        //            var fixtest = @"
+        //using System.Threading;
+        //using System.Threading.Tasks;
+
+        //class TestClass
+        //{
+        //    public async Task TestAsync()
+        //    {
+        //        await Task.Delay(1);
+        //        await Task.Delay(1000);
+        //    }
+        //}";
+
+        //            var expected = VerifyCS.Diagnostic("ASYNC002").WithLocation(0);
+        //            await VerifyCS.VerifyCodeFixAsync(test, expected, fixtest);
+        //        }
+
+        [TestMethod]
+        public async Task NoWarning_WhenThreadSleepInsideNonAsyncMethod()
+        {
+            var test = @"
+using System.Threading;
+
+class TestClass
+{
+    public void Test()
+    {
+        Thread.Sleep(1000);
+    }
+}";
+
+            await VerifyCS.VerifyAnalyzerAsync(test);
+        }
+
+        [TestMethod]
+        public async Task NoWarning_WhenThreadSleepInsideNonAsyncLambda()
+        {
+            var test = @"
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public async Task TestAsync()
+    {
+        await Task.Delay(1);
+        Action a = () => Thread.Sleep(10);
+        a();
+    }
+}";
+
+            await VerifyCS.VerifyAnalyzerAsync(test);
+        }
+
+        // ============================================================ new: ASYNC003 (async void)
+
+        [TestMethod]
+        public async Task Warning_WhenAsyncVoidMethod()
+        {
+            var test = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public async void {|#0:Foo|}()
+    {
+        await Task.Delay(1);
+    }
+}";
+
+            var expected = VerifyCS.Diagnostic("ASYNC003").WithLocation(0).WithArguments("Foo");
+            await VerifyCS.VerifyAnalyzerAsync(test, expected);
+        }
+
+        [TestMethod]
+        public async Task NoWarning_WhenAsyncVoidIsEventHandler()
+        {
+            var test = @"
+using System;
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public async void OnClick(object sender, EventArgs e)
+    {
+        await Task.Delay(1);
+    }
+}";
+
+            await VerifyCS.VerifyAnalyzerAsync(test);
+        }
+
+        [TestMethod]
+        public async Task NoWarning_WhenAsyncTaskMethod()
+        {
+            var test = @"
+using System.Threading.Tasks;
+
+class TestClass
+{
+    public async Task Foo()
+    {
+        await Task.Delay(1);
+    }
+}";
+
+            await VerifyCS.VerifyAnalyzerAsync(test);
+        }
     }
 }

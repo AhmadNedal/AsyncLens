@@ -3,6 +3,7 @@ using Microsoft.CodeAnalysis.CodeActions;
 using Microsoft.CodeAnalysis.CodeFixes;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.Formatting;
 using Microsoft.CodeAnalysis.Simplification;
 using System.Collections.Generic;
@@ -18,17 +19,25 @@ namespace AsyncLens
     public class AsyncLensCodeFixProvider : CodeFixProvider
     {
         private const string MakeAsyncTitle = "Make method async and await the task";
+        private const string SleepTitle = "Replace Thread.Sleep with await Task.Delay";
 
         private enum ReturnKind { None, Void, Task, TaskOfT, Other }
 
         public sealed override ImmutableArray<string> FixableDiagnosticIds
         {
-            get { return ImmutableArray.Create(AsyncLensAnalyzer.DiagnosticId); }
+            get
+            {
+                return ImmutableArray.Create(
+                    AsyncLensAnalyzer.DiagnosticId,
+                    AsyncLensAnalyzer.SleepDiagnosticId);
+            }
         }
 
+        // Fix All is intentionally disabled: the built-in BatchFixer can apply the
+        // "make method async" fix twice to the same method when it has several diagnostics.
         public sealed override FixAllProvider GetFixAllProvider()
         {
-            return WellKnownFixAllProviders.BatchFixer;
+            return null;
         }
 
         public sealed override async Task RegisterCodeFixesAsync(CodeFixContext context)
@@ -44,6 +53,12 @@ namespace AsyncLens
             if (access == null || access.Name.Identifier != token)
                 return;
 
+            if (diagnostic.Id == AsyncLensAnalyzer.SleepDiagnosticId)
+            {
+                RegisterSleepFix(context, access, diagnostic);
+                return;
+            }
+
             ExpressionSyntax target, task;
             if (!TryGetFixTarget(access, out target, out task))
                 return;
@@ -56,8 +71,8 @@ namespace AsyncLens
                 !IsConfirmedBlockingCall(access, semanticModel, context.CancellationToken))
                 return;
 
-            // Case 1: already inside an async function -> simple replacement.
-            if (IsInsideAsyncFunction(target))
+            // Case 1: already inside an async function (or top-level statements) -> simple replacement.
+            if (AsyncLensHelpers.IsInsideAsyncFunction(target) || IsInTopLevelStatement(target))
             {
                 context.RegisterCodeFix(
                     CodeAction.Create(
@@ -77,6 +92,17 @@ namespace AsyncLens
             if (!CanMakeMethodAsync(method, semanticModel, context.CancellationToken, out kind))
                 return;
 
+            // Changing the return type (void / T -> Task) is only safe when nobody can call the method.
+            if (kind == ReturnKind.Void || kind == ReturnKind.Other)
+            {
+                var symbol = semanticModel.GetDeclaredSymbol(method, context.CancellationToken);
+                if (symbol == null || IsExternallyVisible(symbol))
+                    return;
+
+                if (await HasReferencesAsync(context.Document, symbol, context.CancellationToken).ConfigureAwait(false))
+                    return;
+            }
+
             context.RegisterCodeFix(
                 CodeAction.Create(
                     title: MakeAsyncTitle,
@@ -85,7 +111,49 @@ namespace AsyncLens
                 diagnostic);
         }
 
-        // ---------------------------------------------------------------- target detection
+        // ---------------------------------------------------------------- Thread.Sleep fix (ASYNC002)
+
+        private static void RegisterSleepFix(
+            CodeFixContext context, MemberAccessExpressionSyntax access, Diagnostic diagnostic)
+        {
+            var invocation = access.Parent as InvocationExpressionSyntax;
+            if (invocation == null ||
+                invocation.Expression != access ||
+                !(invocation.Parent is ExpressionStatementSyntax))
+                return;
+
+            if (!IsAwaitAllowedAt(invocation))
+                return;
+
+            context.RegisterCodeFix(
+                CodeAction.Create(
+                    title: SleepTitle,
+                    createChangedDocument: ct => ReplaceSleepAsync(context.Document, invocation, ct),
+                    equivalenceKey: "AsyncLens.ReplaceSleep"),
+                diagnostic);
+        }
+
+        private static async Task<Document> ReplaceSleepAsync(
+            Document document, InvocationExpressionSyntax invocation, CancellationToken cancellationToken)
+        {
+            var root = await document.GetSyntaxRootAsync(cancellationToken).ConfigureAwait(false);
+
+            var arguments = invocation.ArgumentList.WithoutTrailingTrivia().ToFullString();
+            var delay = SyntaxFactory.ParseExpression("System.Threading.Tasks.Task.Delay" + arguments)
+                .WithAdditionalAnnotations(Simplifier.Annotation);
+
+            ExpressionSyntax awaited = SyntaxFactory.AwaitExpression(
+                SyntaxFactory.Token(SyntaxKind.AwaitKeyword).WithTrailingTrivia(SyntaxFactory.Space),
+                delay);
+
+            var newRoot = root.ReplaceNode(invocation, awaited.WithTriviaFrom(invocation));
+            var newDocument = document.WithSyntaxRoot(newRoot);
+
+            return await Simplifier.ReduceAsync(
+                newDocument, Simplifier.Annotation, cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+
+        // ---------------------------------------------------------------- target detection (ASYNC001)
 
         private static bool TryGetFixTarget(
             MemberAccessExpressionSyntax access, out ExpressionSyntax target, out ExpressionSyntax task)
@@ -133,6 +201,7 @@ namespace AsyncLens
                     }
             }
 
+            // WaitAll / WaitAny and anything else: report only, no automatic fix.
             return false;
         }
 
@@ -142,70 +211,49 @@ namespace AsyncLens
             switch (access.Name.Identifier.ValueText)
             {
                 case "Result":
-                    {
-                        var property = model.GetSymbolInfo(access, ct).Symbol as IPropertySymbol;
-                        return property != null &&
-                               IsSystemType(property.ContainingType, "System.Threading.Tasks", "Task", 1);
-                    }
+                    return AsyncLensHelpers.IsTaskResult(model.GetSymbolInfo(access, ct).Symbol as IPropertySymbol);
 
                 case "Wait":
                     {
                         var inv = access.Parent as InvocationExpressionSyntax;
                         var method = inv == null ? null : model.GetSymbolInfo(inv, ct).Symbol as IMethodSymbol;
-                        return method != null &&
-                               method.Parameters.Length == 0 &&
-                               IsSystemType(method.ContainingType, "System.Threading.Tasks", "Task", 0);
+                        return AsyncLensHelpers.IsTaskWait(method) && method.Parameters.Length == 0;
                     }
 
                 case "GetResult":
                     {
                         var inv = access.Parent as InvocationExpressionSyntax;
                         var getResult = inv == null ? null : model.GetSymbolInfo(inv, ct).Symbol as IMethodSymbol;
-                        if (getResult == null ||
-                            !(IsSystemType(getResult.ContainingType, "System.Runtime.CompilerServices", "TaskAwaiter", 0) ||
-                              IsSystemType(getResult.ContainingType, "System.Runtime.CompilerServices", "TaskAwaiter", 1)))
+                        if (!AsyncLensHelpers.IsAwaiterGetResult(getResult))
                             return false;
 
+                        // The awaiter must come from Task / ValueTask (or their ConfigureAwait), not a custom extension.
                         var getAwaiterCall = access.Expression as InvocationExpressionSyntax;
-                        var getAwaiter = getAwaiterCall == null ? null : model.GetSymbolInfo(getAwaiterCall, ct).Symbol as IMethodSymbol;
-                        return getAwaiter != null &&
-                               getAwaiter.Name == "GetAwaiter" &&
-                               (IsSystemType(getAwaiter.ContainingType, "System.Threading.Tasks", "Task", 0) ||
-                                IsSystemType(getAwaiter.ContainingType, "System.Threading.Tasks", "Task", 1));
+                        var getAwaiter = getAwaiterCall == null
+                            ? null
+                            : model.GetSymbolInfo(getAwaiterCall, ct).Symbol as IMethodSymbol;
+                        return AsyncLensHelpers.IsAwaitableGetAwaiter(getAwaiter);
                     }
             }
 
             return false;
         }
 
-        private static bool IsSystemType(INamedTypeSymbol type, string ns, string name, int arity)
-        {
-            if (type == null || type.Name != name || type.Arity != arity)
-                return false;
-
-            return type.ContainingNamespace?.ToDisplayString() == ns;
-        }
-
         // ---------------------------------------------------------------- context checks
 
-        private static bool IsInsideAsyncFunction(SyntaxNode node)
+        private static bool IsInTopLevelStatement(SyntaxNode node)
         {
             foreach (var ancestor in node.Ancestors())
             {
-                var method = ancestor as MethodDeclarationSyntax;
-                if (method != null)
-                    return method.Modifiers.Any(SyntaxKind.AsyncKeyword);
-
-                var local = ancestor as LocalFunctionStatementSyntax;
-                if (local != null)
-                    return local.Modifiers.Any(SyntaxKind.AsyncKeyword);
-
-                var anon = ancestor as AnonymousFunctionExpressionSyntax;
-                if (anon != null)
-                    return anon.AsyncKeyword.IsKind(SyntaxKind.AsyncKeyword);
-
-                if (ancestor is BaseMethodDeclarationSyntax || ancestor is AccessorDeclarationSyntax)
+                if (ancestor is MethodDeclarationSyntax ||
+                    ancestor is LocalFunctionStatementSyntax ||
+                    ancestor is AnonymousFunctionExpressionSyntax ||
+                    ancestor is BaseMethodDeclarationSyntax ||
+                    ancestor is AccessorDeclarationSyntax)
                     return false;
+
+                if (ancestor is GlobalStatementSyntax)
+                    return true;
             }
 
             return false;
@@ -298,9 +346,9 @@ namespace AsyncLens
             else
             {
                 var named = returnType as INamedTypeSymbol;
-                if (IsSystemType(named, "System.Threading.Tasks", "Task", 0))
+                if (AsyncLensHelpers.IsType(named, AsyncLensHelpers.TasksNs, "Task", 0))
                     kind = ReturnKind.Task;
-                else if (IsSystemType(named, "System.Threading.Tasks", "Task", 1))
+                else if (AsyncLensHelpers.IsType(named, AsyncLensHelpers.TasksNs, "Task", 1))
                     kind = ReturnKind.TaskOfT;
                 else if (named != null && named.Name == "ValueTask")
                     return false; // would become Task<ValueTask<T>>: not supported
@@ -310,7 +358,7 @@ namespace AsyncLens
 
             // Changing the return type would break overrides / interface implementations.
             if ((kind == ReturnKind.Void || kind == ReturnKind.Other) &&
-                (symbol.IsOverride || ImplementsInterfaceMember(symbol)))
+                (symbol.IsOverride || AsyncLensHelpers.ImplementsInterfaceMember(symbol)))
                 return false;
 
             // 'return null;' in a Task method would become a NullReferenceException after 'await'.
@@ -324,23 +372,28 @@ namespace AsyncLens
             return true;
         }
 
-        private static bool ImplementsInterfaceMember(IMethodSymbol symbol)
+        // public/protected member of public/protected types (InternalsVisibleTo is not considered).
+        private static bool IsExternallyVisible(ISymbol symbol)
         {
-            var type = symbol.ContainingType;
-            if (type == null)
-                return false;
-
-            foreach (var iface in type.AllInterfaces)
+            for (var s = symbol; s != null && s.Kind != SymbolKind.Namespace; s = s.ContainingSymbol)
             {
-                foreach (var member in iface.GetMembers())
-                {
-                    var impl = type.FindImplementationForInterfaceMember(member);
-                    if (SymbolEqualityComparer.Default.Equals(impl, symbol))
-                        return true;
-                }
+                var accessibility = s.DeclaredAccessibility;
+                if (accessibility != Accessibility.Public &&
+                    accessibility != Accessibility.Protected &&
+                    accessibility != Accessibility.ProtectedOrInternal)
+                    return false;
             }
 
-            return false;
+            return true;
+        }
+
+        private static async Task<bool> HasReferencesAsync(
+            Document document, ISymbol symbol, CancellationToken cancellationToken)
+        {
+            var references = await SymbolFinder.FindReferencesAsync(
+                symbol, document.Project.Solution, cancellationToken).ConfigureAwait(false);
+
+            return references.Any(r => r.Locations.Any());
         }
 
         // Descendants that belong to this method itself (not to nested lambdas / local functions).

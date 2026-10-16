@@ -19,7 +19,7 @@
 		<DevelopmentDependency>true</DevelopmentDependency>
 		<NoPackageAnalysis>true</NoPackageAnalysis>
 
-		<!-- <PackageLicenseExpression>MIT</PackageLicenseExpression> -->
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
 		<!-- <RepositoryUrl>https://github.com/YOU/REPO</RepositoryUrl> -->
 		<!-- <PackageProjectUrl>https://github.com/YOU/REPO</PackageProjectUrl> -->
 
