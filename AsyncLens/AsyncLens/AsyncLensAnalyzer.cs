@@ -1,5 +1,4 @@
-﻿
-using Microsoft.CodeAnalysis;
+﻿using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
@@ -22,159 +21,91 @@ namespace AsyncLens
                 isEnabledByDefault: true,
                 description: "Blocking on a Task can cause thread starvation or deadlocks in some contexts.");
 
-        public override ImmutableArray<DiagnosticDescriptor>
-            SupportedDiagnostics
+        public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics
         {
             get { return ImmutableArray.Create(Rule); }
         }
 
         public override void Initialize(AnalysisContext context)
         {
-            context.ConfigureGeneratedCodeAnalysis(
-                GeneratedCodeAnalysisFlags.None);
-
+            context.ConfigureGeneratedCodeAnalysis(GeneratedCodeAnalysisFlags.None);
             context.EnableConcurrentExecution();
 
-            context.RegisterSyntaxNodeAction(
-                AnalyzeMemberAccess,
-                SyntaxKind.SimpleMemberAccessExpression);
-
-            context.RegisterSyntaxNodeAction(
-                AnalyzeInvocation,
-                SyntaxKind.InvocationExpression);
+            context.RegisterSyntaxNodeAction(AnalyzeMemberAccess, SyntaxKind.SimpleMemberAccessExpression);
+            context.RegisterSyntaxNodeAction(AnalyzeInvocation, SyntaxKind.InvocationExpression);
         }
 
-        private static void AnalyzeMemberAccess(
-            SyntaxNodeAnalysisContext context)
+        // task.Result  (Task<T>)
+        private static void AnalyzeMemberAccess(SyntaxNodeAnalysisContext context)
         {
-            var memberAccess =
-                (MemberAccessExpressionSyntax)context.Node;
+            var memberAccess = (MemberAccessExpressionSyntax)context.Node;
 
             if (memberAccess.Name.Identifier.ValueText != "Result")
                 return;
 
-            var type = context.SemanticModel.GetTypeInfo(
-                memberAccess.Expression,
-                context.CancellationToken).Type;
+            var property = context.SemanticModel
+                .GetSymbolInfo(memberAccess, context.CancellationToken).Symbol as IPropertySymbol;
 
-            var namedType = type as INamedTypeSymbol;
-
-            if (namedType == null ||
-                !IsTaskType(namedType) ||
-                namedType.TypeArguments.Length != 1)
-            {
+            if (property == null || property.Name != "Result")
                 return;
-            }
+
+            if (!IsSystemType(property.ContainingType, "System.Threading.Tasks", "Task", 1))
+                return;
 
             Report(context, memberAccess.Name.GetLocation());
         }
 
-        private static void AnalyzeInvocation(
-            SyntaxNodeAnalysisContext context)
+        // task.Wait(...)  and  task.GetAwaiter().GetResult()
+        private static void AnalyzeInvocation(SyntaxNodeAnalysisContext context)
         {
-            var invocation =
-                (InvocationExpressionSyntax)context.Node;
+            var invocation = (InvocationExpressionSyntax)context.Node;
 
-            var memberAccess =
-                invocation.Expression as MemberAccessExpressionSyntax;
-
+            var memberAccess = invocation.Expression as MemberAccessExpressionSyntax;
             if (memberAccess == null)
                 return;
 
-            var methodSymbol =
-                context.SemanticModel.GetSymbolInfo(
-                    invocation,
-                    context.CancellationToken).Symbol as IMethodSymbol;
-
-            if (methodSymbol == null)
+            string name = memberAccess.Name.Identifier.ValueText;
+            if (name != "Wait" && name != "GetResult")
                 return;
 
-            // Detect Task.Wait()
-            if (methodSymbol.Name == "Wait" &&
-                invocation.ArgumentList.Arguments.Count == 0)
-            {
-                var receiverType =
-                    context.SemanticModel.GetTypeInfo(
-                        memberAccess.Expression,
-                        context.CancellationToken).Type;
+            var method = context.SemanticModel
+                .GetSymbolInfo(invocation, context.CancellationToken).Symbol as IMethodSymbol;
 
-                if (IsTaskType(receiverType))
-                {
-                    Report(context, memberAccess.Name.GetLocation());
-                    return;
-                }
-            }
+            if (method == null)
+                return;
 
-            // Detect Task.GetAwaiter().GetResult()
-            if (methodSymbol.Name == "GetResult")
+            if (name == "Wait")
             {
-                if (IsTaskGetAwaiterResult(memberAccess, context))
+                // Wait is declared on System.Threading.Tasks.Task (also for Task<T> receivers).
+                if (method.Name == "Wait" &&
+                    IsSystemType(method.ContainingType, "System.Threading.Tasks", "Task", 0))
                 {
                     Report(context, memberAccess.Name.GetLocation());
                 }
             }
-        }
-
-        private static bool IsTaskType(ITypeSymbol type)
-        {
-            var namedType = type as INamedTypeSymbol;
-
-            while (namedType != null)
+            else if (method.Name == "GetResult")
             {
-                if (namedType.Name == "Task" &&
-                    namedType.ContainingNamespace != null &&
-                    namedType.ContainingNamespace.ToDisplayString()
-                        == "System.Threading.Tasks")
+                // Only the real TaskAwaiter / TaskAwaiter<T>, so custom awaiters are not flagged.
+                var type = method.ContainingType;
+                if (IsSystemType(type, "System.Runtime.CompilerServices", "TaskAwaiter", 0) ||
+                    IsSystemType(type, "System.Runtime.CompilerServices", "TaskAwaiter", 1))
                 {
-                    return true;
+                    Report(context, memberAccess.Name.GetLocation());
                 }
-
-                namedType = namedType.BaseType;
             }
-
-            return false;
         }
 
-        private static bool IsTaskGetAwaiterResult(
-            MemberAccessExpressionSyntax getResultAccess,
-            SyntaxNodeAnalysisContext context)
+        private static bool IsSystemType(INamedTypeSymbol type, string ns, string name, int arity)
         {
-            var getAwaiterInvocation =
-                getResultAccess.Expression as InvocationExpressionSyntax;
-
-            if (getAwaiterInvocation == null)
+            if (type == null || type.Name != name || type.Arity != arity)
                 return false;
 
-            var getAwaiterAccess =
-                getAwaiterInvocation.Expression
-                    as MemberAccessExpressionSyntax;
-
-            if (getAwaiterAccess == null ||
-                getAwaiterAccess.Name.Identifier.ValueText != "GetAwaiter")
-            {
-                return false;
-            }
-
-            var getAwaiterMethod =
-                context.SemanticModel.GetSymbolInfo(
-                    getAwaiterInvocation,
-                    context.CancellationToken).Symbol as IMethodSymbol;
-
-            if (getAwaiterMethod == null ||
-                getAwaiterMethod.Name != "GetAwaiter")
-            {
-                return false;
-            }
-
-            return IsTaskType(getAwaiterMethod.ContainingType);
+            return type.ContainingNamespace?.ToDisplayString() == ns;
         }
 
-        private static void Report(
-            SyntaxNodeAnalysisContext context,
-            Location location)
+        private static void Report(SyntaxNodeAnalysisContext context, Location location)
         {
-            var diagnostic = Diagnostic.Create(Rule, location);
-            context.ReportDiagnostic(diagnostic);
+            context.ReportDiagnostic(Diagnostic.Create(Rule, location));
         }
     }
 }

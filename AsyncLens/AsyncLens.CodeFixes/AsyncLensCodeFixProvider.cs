@@ -3,9 +3,8 @@ using Microsoft.CodeAnalysis.CodeActions;
 using Microsoft.CodeAnalysis.CodeFixes;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.Rename;
-using Microsoft.CodeAnalysis.Text;
-using System;
+using Microsoft.CodeAnalysis.Formatting;
+using Microsoft.CodeAnalysis.Simplification;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Composition;
@@ -18,6 +17,10 @@ namespace AsyncLens
     [ExportCodeFixProvider(LanguageNames.CSharp, Name = nameof(AsyncLensCodeFixProvider)), Shared]
     public class AsyncLensCodeFixProvider : CodeFixProvider
     {
+        private const string MakeAsyncTitle = "Make method async and await the task";
+
+        private enum ReturnKind { None, Void, Task, TaskOfT, Other }
+
         public sealed override ImmutableArray<string> FixableDiagnosticIds
         {
             get { return ImmutableArray.Create(AsyncLensAnalyzer.DiagnosticId); }
@@ -25,47 +28,505 @@ namespace AsyncLens
 
         public sealed override FixAllProvider GetFixAllProvider()
         {
-            // See https://github.com/dotnet/roslyn/blob/main/docs/analyzers/FixAllProvider.md for more information on Fix All Providers
             return WellKnownFixAllProviders.BatchFixer;
         }
 
         public sealed override async Task RegisterCodeFixesAsync(CodeFixContext context)
         {
             var root = await context.Document.GetSyntaxRootAsync(context.CancellationToken).ConfigureAwait(false);
+            if (root == null)
+                return;
 
-            // TODO: Replace the following code with your own analysis, generating a CodeAction for each fix to suggest
-            var diagnostic = context.Diagnostics.First();
-            var diagnosticSpan = diagnostic.Location.SourceSpan;
+            var diagnostic = context.Diagnostics[0];
+            var token = root.FindToken(diagnostic.Location.SourceSpan.Start);
 
-            // Find the type declaration identified by the diagnostic.
-            var declaration = root.FindToken(diagnosticSpan.Start).Parent.AncestorsAndSelf().OfType<TypeDeclarationSyntax>().First();
+            var access = token.Parent?.Parent as MemberAccessExpressionSyntax;
+            if (access == null || access.Name.Identifier != token)
+                return;
 
-            // Register a code action that will invoke the fix.
+            ExpressionSyntax target, task;
+            if (!TryGetFixTarget(access, out target, out task))
+                return;
+
+            if (!IsAwaitAllowedAt(target))
+                return;
+
+            var semanticModel = await context.Document.GetSemanticModelAsync(context.CancellationToken).ConfigureAwait(false);
+            if (semanticModel == null ||
+                !IsConfirmedBlockingCall(access, semanticModel, context.CancellationToken))
+                return;
+
+            // Case 1: already inside an async function -> simple replacement.
+            if (IsInsideAsyncFunction(target))
+            {
+                context.RegisterCodeFix(
+                    CodeAction.Create(
+                        title: CodeFixResources.CodeFixTitle,
+                        createChangedDocument: ct => ReplaceWithAwaitAsync(context.Document, target, task, ct),
+                        equivalenceKey: nameof(CodeFixResources.CodeFixTitle)),
+                    diagnostic);
+                return;
+            }
+
+            // Case 2: directly inside a non-async method -> offer to make the method async.
+            var method = GetDirectEnclosingMethod(target);
+            if (method == null)
+                return;
+
+            ReturnKind kind;
+            if (!CanMakeMethodAsync(method, semanticModel, context.CancellationToken, out kind))
+                return;
+
             context.RegisterCodeFix(
                 CodeAction.Create(
-                    title: CodeFixResources.CodeFixTitle,
-                    createChangedSolution: c => MakeUppercaseAsync(context.Document, declaration, c),
-                    equivalenceKey: nameof(CodeFixResources.CodeFixTitle)),
+                    title: MakeAsyncTitle,
+                    createChangedDocument: ct => MakeAsyncAndAwaitAsync(context.Document, target, task, method, kind, ct),
+                    equivalenceKey: "AsyncLens.MakeMethodAsync"),
                 diagnostic);
         }
 
-        private async Task<Solution> MakeUppercaseAsync(Document document, TypeDeclarationSyntax typeDecl, CancellationToken cancellationToken)
+        // ---------------------------------------------------------------- target detection
+
+        private static bool TryGetFixTarget(
+            MemberAccessExpressionSyntax access, out ExpressionSyntax target, out ExpressionSyntax task)
         {
-            // Compute new uppercase name.
-            var identifierToken = typeDecl.Identifier;
-            var newName = identifierToken.Text.ToUpperInvariant();
+            target = null;
+            task = null;
 
-            // Get the symbol representing the type to be renamed.
-            var semanticModel = await document.GetSemanticModelAsync(cancellationToken);
-            var typeSymbol = semanticModel.GetDeclaredSymbol(typeDecl, cancellationToken);
+            switch (access.Name.Identifier.ValueText)
+            {
+                case "Result":
+                    target = access;
+                    task = access.Expression;
+                    return true;
 
-            // Produce a new solution that has all references to that type renamed, including the declaration.
-            var originalSolution = document.Project.Solution;
-            var optionSet = originalSolution.Workspace.Options;
-            var newSolution = await Renamer.RenameSymbolAsync(document.Project.Solution, typeSymbol, newName, optionSet, cancellationToken).ConfigureAwait(false);
+                case "Wait":
+                    {
+                        // Only the parameterless Wait() used as a statement (other overloads return bool).
+                        var inv = access.Parent as InvocationExpressionSyntax;
+                        if (inv == null || inv.Expression != access ||
+                            inv.ArgumentList.Arguments.Count != 0 ||
+                            !(inv.Parent is ExpressionStatementSyntax))
+                            return false;
 
-            // Return the new solution with the now-uppercase type name.
-            return newSolution;
+                        target = inv;
+                        task = access.Expression;
+                        return true;
+                    }
+
+                case "GetResult":
+                    {
+                        var inv = access.Parent as InvocationExpressionSyntax;
+                        if (inv == null || inv.Expression != access || inv.ArgumentList.Arguments.Count != 0)
+                            return false;
+
+                        var getAwaiterCall = access.Expression as InvocationExpressionSyntax;
+                        var getAwaiterAccess = getAwaiterCall?.Expression as MemberAccessExpressionSyntax;
+                        if (getAwaiterAccess == null ||
+                            getAwaiterAccess.Name.Identifier.ValueText != "GetAwaiter" ||
+                            getAwaiterCall.ArgumentList.Arguments.Count != 0)
+                            return false;
+
+                        target = inv;
+                        task = getAwaiterAccess.Expression;
+                        return true;
+                    }
+            }
+
+            return false;
+        }
+
+        private static bool IsConfirmedBlockingCall(
+            MemberAccessExpressionSyntax access, SemanticModel model, CancellationToken ct)
+        {
+            switch (access.Name.Identifier.ValueText)
+            {
+                case "Result":
+                    {
+                        var property = model.GetSymbolInfo(access, ct).Symbol as IPropertySymbol;
+                        return property != null &&
+                               IsSystemType(property.ContainingType, "System.Threading.Tasks", "Task", 1);
+                    }
+
+                case "Wait":
+                    {
+                        var inv = access.Parent as InvocationExpressionSyntax;
+                        var method = inv == null ? null : model.GetSymbolInfo(inv, ct).Symbol as IMethodSymbol;
+                        return method != null &&
+                               method.Parameters.Length == 0 &&
+                               IsSystemType(method.ContainingType, "System.Threading.Tasks", "Task", 0);
+                    }
+
+                case "GetResult":
+                    {
+                        var inv = access.Parent as InvocationExpressionSyntax;
+                        var getResult = inv == null ? null : model.GetSymbolInfo(inv, ct).Symbol as IMethodSymbol;
+                        if (getResult == null ||
+                            !(IsSystemType(getResult.ContainingType, "System.Runtime.CompilerServices", "TaskAwaiter", 0) ||
+                              IsSystemType(getResult.ContainingType, "System.Runtime.CompilerServices", "TaskAwaiter", 1)))
+                            return false;
+
+                        var getAwaiterCall = access.Expression as InvocationExpressionSyntax;
+                        var getAwaiter = getAwaiterCall == null ? null : model.GetSymbolInfo(getAwaiterCall, ct).Symbol as IMethodSymbol;
+                        return getAwaiter != null &&
+                               getAwaiter.Name == "GetAwaiter" &&
+                               (IsSystemType(getAwaiter.ContainingType, "System.Threading.Tasks", "Task", 0) ||
+                                IsSystemType(getAwaiter.ContainingType, "System.Threading.Tasks", "Task", 1));
+                    }
+            }
+
+            return false;
+        }
+
+        private static bool IsSystemType(INamedTypeSymbol type, string ns, string name, int arity)
+        {
+            if (type == null || type.Name != name || type.Arity != arity)
+                return false;
+
+            return type.ContainingNamespace?.ToDisplayString() == ns;
+        }
+
+        // ---------------------------------------------------------------- context checks
+
+        private static bool IsInsideAsyncFunction(SyntaxNode node)
+        {
+            foreach (var ancestor in node.Ancestors())
+            {
+                var method = ancestor as MethodDeclarationSyntax;
+                if (method != null)
+                    return method.Modifiers.Any(SyntaxKind.AsyncKeyword);
+
+                var local = ancestor as LocalFunctionStatementSyntax;
+                if (local != null)
+                    return local.Modifiers.Any(SyntaxKind.AsyncKeyword);
+
+                var anon = ancestor as AnonymousFunctionExpressionSyntax;
+                if (anon != null)
+                    return anon.AsyncKeyword.IsKind(SyntaxKind.AsyncKeyword);
+
+                if (ancestor is BaseMethodDeclarationSyntax || ancestor is AccessorDeclarationSyntax)
+                    return false;
+            }
+
+            return false;
+        }
+
+        // The method that directly contains the node (null if a lambda/local function/ctor/accessor is closer).
+        private static MethodDeclarationSyntax GetDirectEnclosingMethod(SyntaxNode node)
+        {
+            foreach (var ancestor in node.Ancestors())
+            {
+                var method = ancestor as MethodDeclarationSyntax;
+                if (method != null)
+                    return method;
+
+                if (ancestor is LocalFunctionStatementSyntax ||
+                    ancestor is AnonymousFunctionExpressionSyntax ||
+                    ancestor is BaseMethodDeclarationSyntax ||
+                    ancestor is AccessorDeclarationSyntax)
+                    return null;
+            }
+
+            return null;
+        }
+
+        private static bool IsAwaitAllowedAt(SyntaxNode node)
+        {
+            foreach (var ancestor in node.Ancestors())
+            {
+                if (ancestor is LockStatementSyntax ||       // CS1996
+                    ancestor is UnsafeStatementSyntax ||     // CS4004
+                    ancestor is CatchFilterClauseSyntax ||   // CS7094
+                    ancestor is QueryExpressionSyntax)
+                    return false;
+
+                var method = ancestor as MethodDeclarationSyntax;
+                if (method != null)
+                    return !method.Modifiers.Any(SyntaxKind.UnsafeKeyword);
+
+                var local = ancestor as LocalFunctionStatementSyntax;
+                if (local != null)
+                    return !local.Modifiers.Any(SyntaxKind.UnsafeKeyword);
+
+                if (ancestor is AnonymousFunctionExpressionSyntax)
+                    return true;
+            }
+
+            return true;
+        }
+
+        private static bool CanMakeMethodAsync(
+            MethodDeclarationSyntax method, SemanticModel model, CancellationToken ct, out ReturnKind kind)
+        {
+            kind = ReturnKind.None;
+
+            if (method.Modifiers.Any(SyntaxKind.PartialKeyword) ||
+                method.Modifiers.Any(SyntaxKind.AbstractKeyword) ||
+                method.Modifiers.Any(SyntaxKind.ExternKeyword) ||
+                method.Modifiers.Any(SyntaxKind.UnsafeKeyword))
+                return false;
+
+            if (method.Body == null && method.ExpressionBody == null)
+                return false;
+
+            var symbol = model.GetDeclaredSymbol(method, ct);
+            if (symbol == null || symbol.ReturnsByRef || symbol.ReturnsByRefReadonly)
+                return false;
+
+            if (symbol.ExplicitInterfaceImplementations.Length > 0)
+                return false;
+
+            // async methods cannot have ref/out/in parameters or pointer/ref-struct parameters.
+            if (symbol.Parameters.Any(p => p.RefKind != RefKind.None ||
+                                           p.Type.IsRefLikeType ||
+                                           p.Type.TypeKind == TypeKind.Pointer))
+                return false;
+
+            // Iterators (yield) cannot be turned into async methods this way.
+            if (OwnDescendants<YieldStatementSyntax>(method).Any())
+                return false;
+
+            var returnType = symbol.ReturnType;
+            if (symbol.ReturnsVoid)
+            {
+                kind = ReturnKind.Void;
+            }
+            else if (returnType.TypeKind == TypeKind.Pointer || returnType.IsRefLikeType)
+            {
+                return false;
+            }
+            else
+            {
+                var named = returnType as INamedTypeSymbol;
+                if (IsSystemType(named, "System.Threading.Tasks", "Task", 0))
+                    kind = ReturnKind.Task;
+                else if (IsSystemType(named, "System.Threading.Tasks", "Task", 1))
+                    kind = ReturnKind.TaskOfT;
+                else if (named != null && named.Name == "ValueTask")
+                    return false; // would become Task<ValueTask<T>>: not supported
+                else
+                    kind = ReturnKind.Other;
+            }
+
+            // Changing the return type would break overrides / interface implementations.
+            if ((kind == ReturnKind.Void || kind == ReturnKind.Other) &&
+                (symbol.IsOverride || ImplementsInterfaceMember(symbol)))
+                return false;
+
+            // 'return null;' in a Task method would become a NullReferenceException after 'await'.
+            if (kind == ReturnKind.Task || kind == ReturnKind.TaskOfT)
+            {
+                if (OwnDescendants<ReturnStatementSyntax>(method)
+                    .Any(r => r.Expression != null && r.Expression.IsKind(SyntaxKind.NullLiteralExpression)))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static bool ImplementsInterfaceMember(IMethodSymbol symbol)
+        {
+            var type = symbol.ContainingType;
+            if (type == null)
+                return false;
+
+            foreach (var iface in type.AllInterfaces)
+            {
+                foreach (var member in iface.GetMembers())
+                {
+                    var impl = type.FindImplementationForInterfaceMember(member);
+                    if (SymbolEqualityComparer.Default.Equals(impl, symbol))
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        // Descendants that belong to this method itself (not to nested lambdas / local functions).
+        private static IEnumerable<T> OwnDescendants<T>(SyntaxNode root) where T : SyntaxNode
+        {
+            return root
+                .DescendantNodes(n => !(n is AnonymousFunctionExpressionSyntax) && !(n is LocalFunctionStatementSyntax))
+                .OfType<T>();
+        }
+
+        // ---------------------------------------------------------------- fix 1: already async
+
+        private static async Task<Document> ReplaceWithAwaitAsync(
+            Document document, ExpressionSyntax target, ExpressionSyntax task, CancellationToken cancellationToken)
+        {
+            var root = await document.GetSyntaxRootAsync(cancellationToken).ConfigureAwait(false);
+            var newRoot = root.ReplaceNode(target, CreateAwaitFor(target, task));
+            return document.WithSyntaxRoot(newRoot);
+        }
+
+        private static ExpressionSyntax CreateAwaitFor(ExpressionSyntax target, ExpressionSyntax task)
+        {
+            ExpressionSyntax awaited = CreateAwait(task);
+
+            // (await x).Foo / (await x)[0] / (await x)() etc. need parentheses.
+            if (NeedsParentheses(target))
+                awaited = SyntaxFactory.ParenthesizedExpression(awaited);
+
+            return awaited.WithTriviaFrom(target);
+        }
+
+        private static ExpressionSyntax CreateAwait(ExpressionSyntax operandSource)
+        {
+            ExpressionSyntax operand = operandSource.WithoutTrivia();
+            if (!IsSimpleOperand(operand))
+                operand = SyntaxFactory.ParenthesizedExpression(operand);
+
+            return SyntaxFactory.AwaitExpression(
+                SyntaxFactory.Token(SyntaxKind.AwaitKeyword).WithTrailingTrivia(SyntaxFactory.Space),
+                operand);
+        }
+
+        private static bool IsSimpleOperand(ExpressionSyntax e)
+        {
+            return e is IdentifierNameSyntax
+                || e is GenericNameSyntax
+                || e is MemberAccessExpressionSyntax
+                || e is InvocationExpressionSyntax
+                || e is ElementAccessExpressionSyntax
+                || e is ParenthesizedExpressionSyntax
+                || e is ObjectCreationExpressionSyntax
+                || e is ThisExpressionSyntax;
+        }
+
+        private static bool NeedsParentheses(ExpressionSyntax target)
+        {
+            var parent = target.Parent;
+            if (parent is MemberAccessExpressionSyntax ||
+                parent is ElementAccessExpressionSyntax ||
+                parent is ConditionalAccessExpressionSyntax ||
+                parent is PostfixUnaryExpressionSyntax)
+                return true;
+
+            var inv = parent as InvocationExpressionSyntax;
+            return inv != null && inv.Expression == target;
+        }
+
+        // ---------------------------------------------------------------- fix 2: make method async
+
+        private static async Task<Document> MakeAsyncAndAwaitAsync(
+            Document document,
+            ExpressionSyntax target,
+            ExpressionSyntax task,
+            MethodDeclarationSyntax method,
+            ReturnKind kind,
+            CancellationToken cancellationToken)
+        {
+            var root = await document.GetSyntaxRootAsync(cancellationToken).ConfigureAwait(false);
+
+            // 1) replace the blocking expression inside the method
+            var newMethod = method.ReplaceNode(target, CreateAwaitFor(target, task));
+
+            // 2) returns / expression body: Task-returning methods must now 'await' what they returned
+            if (kind == ReturnKind.Task || kind == ReturnKind.TaskOfT)
+            {
+                if (newMethod.Body != null)
+                {
+                    var body = newMethod.Body;
+                    var newBody = (BlockSyntax)new ReturnRewriter(kind, body).Visit(body);
+                    newMethod = newMethod.WithBody(newBody);
+                }
+                else if (newMethod.ExpressionBody != null)
+                {
+                    var expr = newMethod.ExpressionBody.Expression;
+                    var awaited = CreateAwait(expr).WithTriviaFrom(expr);
+                    newMethod = newMethod.WithExpressionBody(newMethod.ExpressionBody.WithExpression(awaited));
+                }
+            }
+
+            // 3) return type (void -> Task, T -> Task<T>)
+            var returnType = newMethod.ReturnType;
+            TypeSyntax newReturnType = returnType;
+            if (kind == ReturnKind.Void)
+            {
+                newReturnType = SyntaxFactory.ParseTypeName("System.Threading.Tasks.Task");
+            }
+            else if (kind == ReturnKind.Other)
+            {
+                newReturnType = SyntaxFactory.ParseTypeName(
+                    "System.Threading.Tasks.Task<" + returnType.WithoutTrivia().ToString() + ">");
+            }
+
+            if (kind == ReturnKind.Void || kind == ReturnKind.Other)
+            {
+                newReturnType = newReturnType
+                    .WithTriviaFrom(returnType)
+                    .WithAdditionalAnnotations(Simplifier.Annotation);
+            }
+
+            // 4) add the 'async' modifier (last modifier, right before the return type)
+            var asyncToken = SyntaxFactory.Token(SyntaxKind.AsyncKeyword)
+                .WithTrailingTrivia(SyntaxFactory.Space);
+
+            if (newMethod.Modifiers.Count == 0)
+            {
+                asyncToken = asyncToken.WithLeadingTrivia(newReturnType.GetLeadingTrivia());
+                newReturnType = newReturnType.WithLeadingTrivia(SyntaxFactory.TriviaList());
+            }
+
+            newMethod = newMethod
+                .WithModifiers(newMethod.Modifiers.Add(asyncToken))
+                .WithReturnType(newReturnType);
+
+            var newRoot = root.ReplaceNode(method, newMethod.WithAdditionalAnnotations(Formatter.Annotation));
+            var newDocument = document.WithSyntaxRoot(newRoot);
+
+            newDocument = await Simplifier.ReduceAsync(
+                newDocument, Simplifier.Annotation, cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            return newDocument;
+        }
+
+        // Rewrites the method's own 'return' statements (does not enter lambdas / local functions).
+        private sealed class ReturnRewriter : CSharpSyntaxRewriter
+        {
+            private readonly ReturnKind _kind;
+            private readonly BlockSyntax _body;
+
+            public ReturnRewriter(ReturnKind kind, BlockSyntax body)
+            {
+                _kind = kind;
+                _body = body;
+            }
+
+            public override SyntaxNode VisitReturnStatement(ReturnStatementSyntax node)
+            {
+                if (node.Expression == null)
+                    return node;
+
+                var awaited = CreateAwait(node.Expression).WithTriviaFrom(node.Expression);
+
+                // Task<T>:  return x;  ->  return await x;
+                if (_kind == ReturnKind.TaskOfT)
+                    return node.WithExpression(awaited);
+
+                // Task:  return x;  ->  await x;   (at the end of the method)
+                //        return x;  ->  { await x; return; }   (anywhere else)
+                var statement = SyntaxFactory.ExpressionStatement(awaited)
+                    .WithLeadingTrivia(node.GetLeadingTrivia())
+                    .WithTrailingTrivia(node.GetTrailingTrivia());
+
+                bool isLast = node.Parent == _body && _body.Statements.Last() == node;
+                if (isLast)
+                    return statement;
+
+                return SyntaxFactory.Block(
+                        statement.WithoutLeadingTrivia(),
+                        SyntaxFactory.ReturnStatement())
+                    .WithLeadingTrivia(node.GetLeadingTrivia())
+                    .WithAdditionalAnnotations(Formatter.Annotation);
+            }
+
+            public override SyntaxNode VisitSimpleLambdaExpression(SimpleLambdaExpressionSyntax node) { return node; }
+            public override SyntaxNode VisitParenthesizedLambdaExpression(ParenthesizedLambdaExpressionSyntax node) { return node; }
+            public override SyntaxNode VisitAnonymousMethodExpression(AnonymousMethodExpressionSyntax node) { return node; }
+            public override SyntaxNode VisitLocalFunctionStatement(LocalFunctionStatementSyntax node) { return node; }
         }
     }
 }
